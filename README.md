@@ -1,6 +1,6 @@
-# DayZ Discord Bot
+# DayZ Basic Discord Bot
 
-A Discord bot for DayZ server communities. Shows live player counts, server status, restart countdowns, and population trends — via both slash commands and legacy prefix commands.
+A basic Discord bot for DayZ server communities. Shows live player counts, server status, restart countdowns, and population trends — via both slash commands and legacy prefix commands.
 
 ## Features
 
