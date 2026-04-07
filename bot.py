@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import logging
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,15 @@ import a2s
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+log = logging.getLogger(__name__)
+log.addHandler(handler)
+log.setLevel(logging.INFO)
 
 load_dotenv()
 
@@ -139,6 +149,7 @@ async def fetch_players():
 
 _warned_marks: set[int] = set()
 _last_restart_key: Optional[str] = None
+_bg_tasks: dict[str, asyncio.Task] = {}
 
 
 async def status_loop():
@@ -158,6 +169,7 @@ async def status_loop():
                     if getattr(channel, "name", None) != new_name:
                         await channel.edit(name=new_name)
         except Exception:
+            log.exception("status_loop query failed")
             await bot.change_presence(activity=discord.Game(name="Server Offline"))
             if cfg.status_channel_id:
                 channel = bot.get_channel(cfg.status_channel_id)
@@ -177,7 +189,7 @@ async def snapshot_loop():
             info = await fetch_info()
             row.update({"online": int(info.player_count), "max": int(info.max_players), "ok": True})
         except Exception:
-            pass
+            log.exception("snapshot_loop query failed")
 
         with snapshot_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
@@ -203,14 +215,18 @@ async def restart_warning_loop():
 
         remaining = int((nxt - now).total_seconds() // 60)
 
-        for mark in cfg.restart_warn_minutes:
-            if remaining <= mark and mark not in _warned_marks:
-                _warned_marks.add(mark)
-                if channel:
-                    await channel.send(
-                        f"⏳ Server restart in **{mark} minute(s)** (ETA {nxt:%H:%M} UTC)."
-                    )
-                break
+        # Find the single applicable threshold: the smallest configured mark
+        # that covers the current remaining time. This prevents rapid-fire
+        # warnings when the bot starts or reconnects late in a restart window.
+        applicable = next(
+            (m for m in reversed(cfg.restart_warn_minutes) if remaining <= m), None
+        )
+        if applicable is not None and applicable not in _warned_marks:
+            _warned_marks.add(applicable)
+            if channel:
+                await channel.send(
+                    f"⏳ Server restart in **{applicable} minute(s)** (ETA {nxt:%H:%M} UTC)."
+                )
 
         if remaining <= 0 and 0 not in _warned_marks:
             _warned_marks.add(0)
@@ -250,8 +266,9 @@ if cfg.enable_prefix_commands:
             embed = discord.Embed(title="Players Online", description="\n".join(lines), color=0x22C55E)
             embed.set_footer(text=f"Reported: {info.player_count}/{info.max_players}")
             await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"Could not retrieve player list: {e}")
+        except Exception:
+            log.exception("players command failed")
+            await ctx.send("Could not retrieve player list. Check server logs.")
 
     @bot.command()
     async def server(ctx: commands.Context):
@@ -266,8 +283,9 @@ if cfg.enable_prefix_commands:
             embed.add_field(name="Ping", value=f"{round(info.ping * 1000)}ms", inline=True)
             embed.add_field(name="Password", value="Yes" if info.password_protected else "No", inline=True)
             await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"Could not retrieve server info: {e}")
+        except Exception:
+            log.exception("server command failed")
+            await ctx.send("Could not retrieve server info. Check server logs.")
 
     @bot.command()
     async def nextrestart(ctx: commands.Context):
@@ -293,8 +311,9 @@ if cfg.enable_prefix_commands:
             await ctx.send(f"Server has been online for **{fmt_uptime(max(uptimes))}**")
         except subprocess.CalledProcessError:
             await ctx.send("Server does not appear to be running right now.")
-        except Exception as e:
-            await ctx.send(f"Could not retrieve uptime: {e}")
+        except Exception:
+            log.exception("uptime command failed")
+            await ctx.send("Could not retrieve uptime. Check server logs.")
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +346,9 @@ if cfg.enable_slash_commands:
             embed = discord.Embed(title="Players Online", description="\n".join(lines), color=0x22C55E)
             embed.set_footer(text=f"Reported: {info.player_count}/{info.max_players}")
             await interaction.response.send_message(embed=embed)
-        except Exception as e:
-            await interaction.response.send_message(f"Could not retrieve player list: {e}", ephemeral=True)
+        except Exception:
+            log.exception("slash players failed")
+            await interaction.response.send_message("Could not retrieve player list. Check server logs.", ephemeral=True)
 
     @bot.tree.command(name="server", description="Show DayZ server status")
     async def slash_server(interaction: discord.Interaction):
@@ -342,8 +362,9 @@ if cfg.enable_slash_commands:
             embed.add_field(name="Version", value=info.version, inline=True)
             embed.add_field(name="Ping", value=f"{round(info.ping * 1000)}ms", inline=True)
             await interaction.response.send_message(embed=embed)
-        except Exception as e:
-            await interaction.response.send_message(f"Could not retrieve server info: {e}", ephemeral=True)
+        except Exception:
+            log.exception("slash server failed")
+            await interaction.response.send_message("Could not retrieve server info. Check server logs.", ephemeral=True)
 
     @bot.tree.command(name="nextrestart", description="Show next scheduled restart time")
     async def slash_nextrestart(interaction: discord.Interaction):
@@ -367,7 +388,8 @@ if cfg.enable_slash_commands:
                 except Exception:
                     continue
 
-        recent = rows[-72:]  # ~6 hours at 5-minute intervals
+        window_rows = max(1, (6 * 3600) // cfg.snapshot_interval_seconds)
+        recent = rows[-window_rows:]
         vals = [r["online"] for r in recent if r.get("ok") and isinstance(r.get("online"), int)]
         if not vals:
             await interaction.response.send_message("No successful snapshots in the recent window.", ephemeral=True)
@@ -385,21 +407,28 @@ if cfg.enable_slash_commands:
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} ({bot.user.id})")
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
     if cfg.enable_slash_commands:
         if cfg.guild_id:
             guild = discord.Object(id=cfg.guild_id)
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} slash command(s) to guild {cfg.guild_id}")
+            log.info("Synced %d slash command(s) to guild %s", len(synced), cfg.guild_id)
         else:
             synced = await bot.tree.sync()
-            print(f"Globally synced {len(synced)} slash command(s)")
+            log.info("Globally synced %d slash command(s)", len(synced))
 
-    asyncio.create_task(status_loop())
-    asyncio.create_task(snapshot_loop())
-    asyncio.create_task(restart_warning_loop())
+    # Only start background tasks if they aren't already running.
+    # on_ready fires on every reconnect, so without this check each
+    # disconnect/reconnect cycle would spawn duplicate loops.
+    for name, fn in [
+        ("status", status_loop),
+        ("snapshot", snapshot_loop),
+        ("warnings", restart_warning_loop),
+    ]:
+        if name not in _bg_tasks or _bg_tasks[name].done():
+            _bg_tasks[name] = asyncio.create_task(fn())
 
 
 bot.run(cfg.token)
