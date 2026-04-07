@@ -68,6 +68,8 @@ All options are set in `.env`. See `.env.example` for the full reference with de
 
 ## Running as a service (systemd)
 
+Adjust `User` and paths to match your setup.
+
 ```ini
 [Unit]
 Description=DayZ Discord Bot
